@@ -17,6 +17,7 @@ import time
 account_aliases = {}
 websocket_connected = False
 ws = None
+RAW_CONVERSION = 10**30
 
 def trim_account(account):
     if account and len(account) > 30:
@@ -27,10 +28,14 @@ def fetch_aliases():
     global account_aliases
     while True:
         try:
-            response = requests.post('https://api.spyglass.pw/banano/v1/known/accounts')
+            # Using GET request for NanoLooker API
+            response = requests.get('https://nanolooker.com/api/known-accounts')
             if response.status_code == 200:
                 aliases = response.json()
-                account_aliases = {item['address']: item['alias'] for item in aliases}
+                # Update the way we access account and alias based on the NanoLooker response format
+                account_aliases = {item['account']: item['alias'] for item in aliases}
+            else:
+                logging.error(f"Failed to fetch aliases with status code {response.status_code}")
         except Exception as e:
             logging.error(f"Failed to fetch aliases: {e}")
         
@@ -43,7 +48,8 @@ alias_thread.start()
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///transactions.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-MINIMUM_DETECTABLE_BAN_AMOUNT = 10000
+MINIMUM_DETECTABLE_AMOUNT = 1
+MINIMUM_DETECTABLE_AMOUNT_RAW = MINIMUM_DETECTABLE_AMOUNT * RAW_CONVERSION
 PER_PAGE = 20
 
 db.init_app(app)
@@ -88,21 +94,22 @@ def on_message(ws, message):
             transaction_time = datetime.fromtimestamp(int(data["time"]) / 1000, timezone.utc)
 
             # Check if the subtype is 'send' and the amount is greater than the limit
-            if transaction_data["block"]["subtype"] == "send" and float(transaction_data.get("amount_decimal", 0)) > MINIMUM_DETECTABLE_BAN_AMOUNT:
-                sender = transaction_data["account"]
-                receiver = transaction_data["block"].get("link_as_account")
-                if sender != receiver: # Ignore self transactions
-                    existing_transaction = Transaction.query.filter_by(hash=transaction_data["hash"]).first()
-                    if not existing_transaction:
-                        transaction = Transaction(
-                            sender=sender,
-                            receiver=receiver,
-                            amount_decimal=float(format(float(transaction_data["amount_decimal"]), '.2f')),
-                            time=transaction_time,
-                            hash=transaction_data["hash"]
-                        )
-                        db.session.add(transaction)
-                        db.session.commit()
+            if transaction_data["block"]["subtype"] == "send":
+                if float(transaction_data.get("amount", 0)) > MINIMUM_DETECTABLE_AMOUNT_RAW:
+                    sender = transaction_data["account"]
+                    receiver = transaction_data["block"].get("link_as_account")
+                    if sender != receiver: # Ignore self transactions
+                        existing_transaction = Transaction.query.filter_by(hash=transaction_data["hash"]).first()
+                        if not existing_transaction:
+                            transaction = Transaction(
+                                sender=sender,
+                                receiver=receiver,
+                                amount=float(format(float(transaction_data["amount"])/RAW_CONVERSION, '.2f')),
+                                time=transaction_time,
+                                hash=transaction_data["hash"]
+                            )
+                            db.session.add(transaction)
+                            db.session.commit()
 
 def on_error(ws, error):
     logging.error(f"WebSocket error: {error}")
@@ -188,7 +195,7 @@ def index():
     time_frame_display = None
 
     # Default values for filters
-    min_amount = request.args.get('min_amount', default=MINIMUM_DETECTABLE_BAN_AMOUNT, type=int)
+    min_amount = request.args.get('min_amount', default=MINIMUM_DETECTABLE_AMOUNT, type=int)
     time_frame = request.args.get('time_frame', default='30d')
 
     # Calculate the start and end time based on the time frame
@@ -223,7 +230,7 @@ def index():
     transactions_query = Transaction.query.filter(
         Transaction.time >= start_time,
         Transaction.time <= end_time,
-        Transaction.amount_decimal > min_amount
+        Transaction.amount > min_amount
     ).order_by(Transaction.time.desc())
     # Pagination URL Generation with Custom Date Range Support
     url_kwargs = {
@@ -254,14 +261,14 @@ def index():
             'time': transaction.time.isoformat(),
             'sender': sender_alias,
             'receiver': receiver_alias,
-            'amount_decimal': transaction.amount_decimal,
+            'amount': transaction.amount,
             'hash': transaction.hash
         })
 
-    return render_template('index.html', time_frame=time_frame, transactions=transactions_with_alias, filtered=filtered, min_amount=min_amount, date_range=date_range.lower(), time_frame_display=time_frame_display, MINIMUM_DETECTABLE_BAN_AMOUNT=MINIMUM_DETECTABLE_BAN_AMOUNT, next_url=next_url, prev_url=prev_url, trim_account=trim_account)
+    return render_template('index.html', time_frame=time_frame, transactions=transactions_with_alias, filtered=filtered, min_amount=min_amount, date_range=date_range.lower(), time_frame_display=time_frame_display, MINIMUM_DETECTABLE_AMOUNT=MINIMUM_DETECTABLE_AMOUNT, next_url=next_url, prev_url=prev_url, trim_account=trim_account)
 
 if __name__ == '__main__':
-    urls = ["ws.banano.trade", "ws2.banano.trade"]
+    urls = ["rainstorm.city/websocket", "nanoslo.0x.no/websocket"]
     websocket_threads = []
     for url in urls:
         websocket_url = f"wss://{url}"
