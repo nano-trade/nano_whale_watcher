@@ -196,6 +196,8 @@ def index():
 
     # Default values for filters
     min_amount = request.args.get('min_amount', default=MINIMUM_DETECTABLE_AMOUNT, type=int)
+    if min_amount > 100000000000000000:
+        min_amount = 100000000000000000
     time_frame = request.args.get('time_frame', default='30d')
 
     # Calculate the start and end time based on the time frame
