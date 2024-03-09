@@ -128,38 +128,41 @@ MAX_RETRIES = 10  # Maximum number of retries
 INITIAL_RETRY_DELAY = 1  # Initial delay in seconds before the first retry
 
 run_websocket_thread = True
+ws_lock = threading.Lock()
 
 def start_websocket_connection(websocket_url):
-    global run_websocket_thread
+    global ws
     retry_count = 0
     retry_delay = INITIAL_RETRY_DELAY
 
     while run_websocket_thread and retry_count < MAX_RETRIES:
         try:
-            ws = websocket.WebSocketApp(websocket_url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=lambda ws, code, msg: on_close(ws, code, msg))
+            with ws_lock:
+                if ws is not None:
+                    ws.close()
+                    ws = None
 
-            reset_message_timer()  # Start the timer when the WebSocket connection is established
+            # Create a new WebSocket connection
+            with ws_lock:
+                ws = websocket.WebSocketApp(websocket_url,
+                                            on_open=on_open,
+                                            on_message=on_message,
+                                            on_error=on_error,
+                                            on_close=on_close)
+            reset_message_timer()
             ws.run_forever()
-            retry_count = 0  # Reset retry count after a successful connection
-            retry_delay = INITIAL_RETRY_DELAY  # Reset retry delay
-
+            retry_count = 0
+            retry_delay = INITIAL_RETRY_DELAY
         except Exception as e:
             logging.error(f"WebSocket connection failed: {e}")
             time.sleep(retry_delay)
-            retry_delay *= 2  # Exponential backoff
+            retry_delay *= 2
             retry_count += 1
             logging.info(f"Retrying connection... Attempt {retry_count}")
 
-        if message_timer is not None:
-            message_timer.cancel()  # Cancel the timer if max retries are reached
-
+    if message_timer:
+        message_timer.cancel()
     logging.info("WebSocket thread is stopping.")
-
-
 # Modify your existing on_close function to reset the timer
 def on_close(ws, close_status_code, close_msg):
     global websocket_connected
