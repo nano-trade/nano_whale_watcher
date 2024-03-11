@@ -107,6 +107,7 @@ class WebSocketManager:
 
     def on_message(self, ws, message):
         with app.app_context():
+            self.last_message_time = datetime.utcnow()
             global last_message_time
             data = json.loads(message)
             if data.get("topic") == "confirmation":
