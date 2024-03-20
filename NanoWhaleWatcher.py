@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,7 @@ PER_PAGE = 20
 MAX_RETRIES = 10
 INITIAL_RETRY_DELAY = 1
 
+
 class AliasManager:
     def __init__(self):
         self.aliases = {}
@@ -39,7 +41,9 @@ class AliasManager:
     def fetch_aliases(self):
         while True:
             try:
-                response = requests.get("https://nanobrowse.com/api/search/known_accounts")
+                response = requests.get(
+                    "https://nanobrowse.com/api/search/known_accounts"
+                )
                 if response.status_code == 200:
                     aliases = response.json()
                     self.aliases = {item["account"]: item["name"] for item in aliases}
@@ -56,7 +60,9 @@ class AliasManager:
             return f"{account[:10]}...{account[-6:]}"
         return account
 
+
 alias_manager = AliasManager()
+
 
 class WebSocketManager:
     def __init__(self, urls):
@@ -65,15 +71,15 @@ class WebSocketManager:
         self.retry_count = 0
         self.connected = False
         self.lock = threading.Lock()
-        self.threads = []
         self.last_message_time = None
+        # Initialize ThreadPoolExecutor with a maximum of 5 worker threads
+        self.executor = ThreadPoolExecutor(max_workers=5)
 
     def start_connections(self):
+        # Submit connection tasks directly to the executor
         for url in self.urls:
             websocket_url = f"wss://{url}"
-            thread = threading.Thread(target=self.connect, args=(websocket_url,))
-            thread.start()
-            self.threads.append(thread)
+            self.executor.submit(self.connect, websocket_url)
 
     def connect(self, websocket_url):
         retry_delay = INITIAL_RETRY_DELAY
@@ -158,18 +164,29 @@ class WebSocketManager:
         with self.lock:
             if self.ws:
                 self.ws.close()
+            self.executor.shutdown(wait=True)  # Gracefully shutdown the executor
 
-ws_manager = WebSocketManager(urls=["rainstorm.city/websocket", "nanoslo.0x.no/websocket"])
+
+ws_manager = WebSocketManager(
+    urls=["rainstorm.city/websocket", "nanoslo.0x.no/websocket"]
+)
+
 
 @app.route("/websocket-status")
 def websocket_status():
     try:
         if ws_manager.connected and ws_manager.last_message_time:
-            last_message_str = ws_manager.last_message_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+            last_message_str = ws_manager.last_message_time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
             last_message_ago = int(
                 (datetime.utcnow() - ws_manager.last_message_time).total_seconds()
             )
-            status = {"status": True, "last_message": last_message_str, "last_message_ago": last_message_ago}
+            status = {
+                "status": True,
+                "last_message": last_message_str,
+                "last_message_ago": last_message_ago,
+            }
         else:
             status = {"status": False, "last_message": "No message received"}
         return status
@@ -277,12 +294,14 @@ def index():
         MINIMUM_DETECTABLE_AMOUNT=MINIMUM_DETECTABLE_AMOUNT,
         next_url=next_url,
         prev_url=prev_url,
-        trim_account=AliasManager.trim_account
+        trim_account=AliasManager.trim_account,
     )
+
 
 def create_tables():
     with app.app_context():
         db.create_all()
+
 
 if __name__ == "__main__":
     with app.app_context():
