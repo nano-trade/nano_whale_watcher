@@ -10,7 +10,7 @@ import os
 from dotenv import load_dotenv
 import logging
 import requests
-from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +28,8 @@ RAW_CONVERSION = 10**30
 MINIMUM_DETECTABLE_AMOUNT_RAW = MINIMUM_DETECTABLE_AMOUNT * RAW_CONVERSION
 PER_PAGE = 20
 MAX_RETRIES = 10
-INITIAL_RETRY_DELAY = 1
+INITIAL_RETRY_DELAY = 10
+MAX_RETRY_DELAY = 300
 
 
 class AliasManager:
@@ -65,51 +66,74 @@ alias_manager = AliasManager()
 
 
 class WebSocketManager:
-    def __init__(self, urls):
-        self.urls = urls
-        self.ws = None
-        self.retry_count = 0
-        self.connected = False
+    def __init__(self):
+        urls_env = os.getenv("WEBSOCKET_URLS", "")
+        self.urls = [url.strip() for url in urls_env.split(",") if url.strip()]
+        self.connections = {
+            url: {"retry_count": 0, "connected": False} for url in self.urls
+        }
         self.lock = threading.Lock()
+        self.active_connections = 0  # Track number of active connections
+        self.executor = self.create_executor(len(self.urls))
         self.last_message_time = None
-        # Initialize ThreadPoolExecutor with a maximum of 5 worker threads
-        self.executor = ThreadPoolExecutor(max_workers=5)
+
+    def create_executor(self, max_workers):
+        return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+
+    def adjust_thread_pool(self):
+        # Dynamically adjust the thread pool based on the number of active connections
+        desired_workers = min(max(2, self.active_connections), len(self.urls))
+        if desired_workers != len(self.executor._threads):
+            with self.lock:
+                self.shutdown_executor()
+                self.executor = self.create_executor(desired_workers)
 
     def start_connections(self):
-        # Submit connection tasks directly to the executor
         for url in self.urls:
-            websocket_url = f"wss://{url}"
-            self.executor.submit(self.connect, websocket_url)
+            websocket_url = (
+                f"wss://{url}"
+                if not url.startswith(("localhost", "[::1]"))
+                else f"ws://{url}"
+            )
+            self.executor.submit(self.connect, url, websocket_url)
 
-    def connect(self, websocket_url):
+    def connect(self, url, websocket_url):
         retry_delay = INITIAL_RETRY_DELAY
-        while self.retry_count < MAX_RETRIES:
+        max_retries = MAX_RETRIES
+        while self.connections[url]["retry_count"] < max_retries:
             try:
                 with self.lock:
-                    self.ws = websocket.WebSocketApp(
+                    ws = websocket.WebSocketApp(
                         websocket_url,
-                        on_open=self.on_open,
+                        on_open=lambda ws: self.on_open(ws, url),
                         on_message=self.on_message,
-                        on_error=self.on_error,
-                        on_close=self.on_close,
+                        on_error=lambda ws, error: self.on_error(ws, error, url),
+                        on_close=lambda ws, close_status_code, close_msg: self.on_close(
+                            ws, url
+                        ),
                     )
-                self.ws.run_forever()
-                self.retry_count = 0
-                break
+                ws.run_forever()
+                break  # Exit the loop after a successful connection
             except Exception as e:
-                logging.error(f"WebSocket connection failed: {e}")
-                self.retry_count += 1
+                logging.error(f"WebSocket connection failed for {url}: {e}")
+                self.connections[url]["retry_count"] += 1
                 time.sleep(retry_delay)
-                retry_delay *= 2
+                retry_delay *= 2  # Exponential backoff
 
-    def on_open(self, ws):
-        self.connected = True
+    def on_open(self, ws, url):
+        with self.lock:
+            self.connections[url]["connected"] = True
+            self.active_connections += 1  # Increment active connections count
+        self.retry_count = 0  # Reset retries on successful connection
+        # Subscribe to necessary topics
         subscribe_message = {
             "action": "subscribe",
             "topic": "confirmation",
             "options": {"confirmation_type": "all"},
         }
         ws.send(json.dumps(subscribe_message))
+        logging.info(f"WebSocket connected to {url}")
+        self.adjust_thread_pool()  # Adjust the thread pool based on the new number of active connections
 
     def on_message(self, ws, message):
         with app.app_context():
@@ -152,30 +176,65 @@ class WebSocketManager:
                                 db.session.add(transaction)
                                 db.session.commit()
 
-    def on_error(self, ws, error):
-        logging.error(f"WebSocket error: {error}")
+    def on_error(self, ws, error, url):
+        logging.error(f"WebSocket error for {url}: {error}")
+        self.attempt_reconnect(url)
 
-    def on_close(self, ws, close_status_code, close_msg):
-        self.connected = False
-        time.sleep(5)
-        self.start_connections()
+    def on_close(self, ws, url, close_status_code, close_msg):
+        logging.info(
+            f"WebSocket closed for {url} with code {close_status_code}: {close_msg}"
+        )
+        self.connections[url]["connected"] = False
+
+        # Update active connections and adjust thread pool if necessary
+        with self.lock:
+            self.active_connections -= 1
+            self.adjust_thread_pool()
+
+        # Implementing exponential backoff for reconnection
+        retry_delay = INITIAL_RETRY_DELAY
+        for i in range(MAX_RETRIES):
+            time.sleep(retry_delay)
+            if self.connect(url, self.get_websocket_url(url)):
+                break  # Break if reconnection is successful
+            retry_delay = min(
+                retry_delay * 2, MAX_RETRY_DELAY
+            )  # Ensure delay does not exceed a maximum
+
+        if retry_delay >= MAX_RETRY_DELAY:
+            logging.error(f"Max reconnection attempts reached for {url}.")
+
+    def shutdown_executor(self):
+        self.executor.shutdown(wait=True)
+
+    def attempt_reconnect(self, url):
+        if self.connections[url]["retry_count"] < MAX_RETRIES:
+            logging.info(f"Attempting to reconnect to {url}")
+            time.sleep(
+                INITIAL_RETRY_DELAY
+            )  # Simple delay before retrying, consider exponential backoff
+            self.connect(url, self.get_websocket_url(url))
+        else:
+            logging.error(
+                f"Max retries reached for {url}. Consider rotating to another URL if available."
+            )
 
     def shutdown(self):
         with self.lock:
-            if self.ws:
-                self.ws.close()
             self.executor.shutdown(wait=True)  # Gracefully shutdown the executor
 
 
-ws_manager = WebSocketManager(
-    urls=["rainstorm.city/websocket", "nanoslo.0x.no/websocket"]
-)
+ws_manager = WebSocketManager()
 
 
 @app.route("/websocket-status")
 def websocket_status():
     try:
-        if ws_manager.connected and ws_manager.last_message_time:
+        # Check if any connection is currently open
+        any_connected = any(
+            conn["connected"] for conn in ws_manager.connections.values()
+        )
+        if any_connected and ws_manager.last_message_time:
             last_message_str = ws_manager.last_message_time.strftime(
                 "%Y-%m-%d %H:%M:%S UTC"
             )
@@ -188,7 +247,12 @@ def websocket_status():
                 "last_message_ago": last_message_ago,
             }
         else:
-            status = {"status": False, "last_message": "No message received"}
+            status = {
+                "status": False,
+                "last_message": (
+                    "No message received" if any_connected else "All connections closed"
+                ),
+            }
         return status
     except Exception as e:
         logging.error(f"Error in websocket-status: {e}")
