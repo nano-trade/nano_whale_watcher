@@ -27,9 +27,10 @@ MINIMUM_DETECTABLE_AMOUNT = 1000  # 1000 XNO in raw
 RAW_CONVERSION = 10**30
 MINIMUM_DETECTABLE_AMOUNT_RAW = MINIMUM_DETECTABLE_AMOUNT * RAW_CONVERSION
 PER_PAGE = 20
-MAX_RETRIES = 10
-INITIAL_RETRY_DELAY = 10
-MAX_RETRY_DELAY = 300
+MAX_RETRIES = 5
+RETRY_DELAY = 30
+PING_INTERVAL = 30  # Send ping every 30 seconds
+CONNECTION_TIMEOUT = 120  # Consider connection dead if no message for 2 minutes
 
 
 class AliasManager:
@@ -69,24 +70,18 @@ class WebSocketManager:
     def __init__(self):
         urls_env = os.getenv("WEBSOCKET_URLS", "")
         self.urls = [url.strip() for url in urls_env.split(",") if url.strip()]
-        self.connections = {
-            url: {"retry_count": 0, "connected": False} for url in self.urls
-        }
+        self.connections = {}
         self.lock = threading.Lock()
-        self.active_connections = 0  # Track number of active connections
-        self.executor = self.create_executor(len(self.urls))
         self.last_message_time = None
-
-    def create_executor(self, max_workers):
-        return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-
-    def adjust_thread_pool(self):
-        # Dynamically adjust the thread pool based on the number of active connections
-        desired_workers = min(max(2, self.active_connections), len(self.urls))
-        if desired_workers != len(self.executor._threads):
-            with self.lock:
-                self.shutdown_executor()
-                self.executor = self.create_executor(desired_workers)
+        self.shutdown_flag = False
+        
+        # Fixed thread pool - no dynamic resizing
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.urls))
+        
+        # Start health check thread
+        self.health_thread = threading.Thread(target=self.health_check)
+        self.health_thread.daemon = True
+        self.health_thread.start()
 
     def start_connections(self):
         for url in self.urls:
@@ -95,36 +90,52 @@ class WebSocketManager:
                 if not url.startswith(("localhost", "[::1]"))
                 else f"ws://{url}"
             )
-            self.executor.submit(self.connect, url, websocket_url)
+            self.connections[url] = {
+                "ws": None,
+                "connected": False,
+                "retry_count": 0,
+                "last_ping": None,
+                "last_message": None
+            }
+            self.executor.submit(self.connect_with_retry, url, websocket_url)
 
-    def connect(self, url, websocket_url):
-        retry_delay = INITIAL_RETRY_DELAY
-        max_retries = MAX_RETRIES
-        while self.connections[url]["retry_count"] < max_retries:
+    def connect_with_retry(self, url, websocket_url):
+        while not self.shutdown_flag and self.connections[url]["retry_count"] < MAX_RETRIES:
             try:
+                logging.info(f"Connecting to {url}")
+                ws = websocket.WebSocketApp(
+                    websocket_url,
+                    on_open=lambda ws: self.on_open(ws, url),
+                    on_message=lambda ws, message: self.on_message(ws, message, url),
+                    on_error=lambda ws, error: self.on_error(ws, error, url),
+                    on_close=lambda ws, close_status_code, close_msg: self.on_close(
+                        ws, url, close_status_code, close_msg
+                    ),
+                    on_ping=lambda ws, message: self.on_ping(ws, message, url),
+                    on_pong=lambda ws, message: self.on_pong(ws, message, url)
+                )
+                
                 with self.lock:
-                    ws = websocket.WebSocketApp(
-                        websocket_url,
-                        on_open=lambda ws: self.on_open(ws, url),
-                        on_message=self.on_message,
-                        on_error=lambda ws, error: self.on_error(ws, error, url),
-                        on_close=lambda ws, close_status_code, close_msg: self.on_close(
-                            ws, url
-                        ),
-                    )
-                ws.run_forever()
-                break  # Exit the loop after a successful connection
+                    self.connections[url]["ws"] = ws
+                
+                ws.run_forever(ping_interval=PING_INTERVAL)
+                
             except Exception as e:
                 logging.error(f"WebSocket connection failed for {url}: {e}")
-                self.connections[url]["retry_count"] += 1
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                with self.lock:
+                    self.connections[url]["connected"] = False
+                    self.connections[url]["retry_count"] += 1
+                
+                if not self.shutdown_flag:
+                    time.sleep(RETRY_DELAY)
 
     def on_open(self, ws, url):
         with self.lock:
             self.connections[url]["connected"] = True
-            self.active_connections += 1  # Increment active connections count
-        self.retry_count = 0  # Reset retries on successful connection
+            self.connections[url]["retry_count"] = 0
+            self.connections[url]["last_ping"] = datetime.now(timezone.utc)
+            self.connections[url]["last_message"] = datetime.now(timezone.utc)
+        
         # Subscribe to necessary topics
         subscribe_message = {
             "action": "subscribe",
@@ -133,95 +144,119 @@ class WebSocketManager:
         }
         ws.send(json.dumps(subscribe_message))
         logging.info(f"WebSocket connected to {url}")
-        self.adjust_thread_pool()  # Adjust the thread pool based on the new number of active connections
 
-    def on_message(self, ws, message):
+    def on_message(self, ws, message, url):
         with app.app_context():
-            self.last_message_time = datetime.utcnow()
-            global last_message_time
-            data = json.loads(message)
-            if data.get("topic") == "confirmation":
-                last_message_time = datetime.utcnow()
-                transaction_data = data["message"]
-                transaction_time = datetime.fromtimestamp(
-                    int(data["time"]) / 1000, timezone.utc
-                )
+            current_time = datetime.now(timezone.utc)
+            self.last_message_time = current_time
+            
+            with self.lock:
+                self.connections[url]["last_message"] = current_time
+            
+            try:
+                data = json.loads(message)
+                if data.get("topic") == "confirmation":
+                    transaction_data = data["message"]
+                    transaction_time = datetime.fromtimestamp(
+                        int(data["time"]) / 1000, timezone.utc
+                    )
 
-                # Check if the subtype is 'send' and the amount is greater than the limit
-                if transaction_data["block"]["subtype"] == "send":
-                    if (
-                        float(transaction_data.get("amount", 0))
-                        > MINIMUM_DETECTABLE_AMOUNT_RAW
-                    ):
-                        sender = transaction_data["account"]
-                        receiver = transaction_data["block"].get("link_as_account")
-                        if sender != receiver:  # Ignore self transactions
-                            existing_transaction = Transaction.query.filter_by(
-                                hash=transaction_data["hash"]
-                            ).first()
-                            if not existing_transaction:
-                                transaction = Transaction(
-                                    sender=sender,
-                                    receiver=receiver,
-                                    amount=float(
-                                        format(
-                                            float(transaction_data["amount"])
-                                            / RAW_CONVERSION,
-                                            ".2f",
-                                        )
-                                    ),
-                                    time=transaction_time,
-                                    hash=transaction_data["hash"],
-                                )
-                                db.session.add(transaction)
-                                db.session.commit()
+                    # Check if the subtype is 'send' and the amount is greater than the limit
+                    if transaction_data["block"]["subtype"] == "send":
+                        if (
+                            float(transaction_data.get("amount", 0))
+                            > MINIMUM_DETECTABLE_AMOUNT_RAW
+                        ):
+                            sender = transaction_data["account"]
+                            receiver = transaction_data["block"].get("link_as_account")
+                            if sender != receiver:  # Ignore self transactions
+                                existing_transaction = Transaction.query.filter_by(
+                                    hash=transaction_data["hash"]
+                                ).first()
+                                if not existing_transaction:
+                                    transaction = Transaction(
+                                        sender=sender,
+                                        receiver=receiver,
+                                        amount=float(
+                                            format(
+                                                float(transaction_data["amount"])
+                                                / RAW_CONVERSION,
+                                                ".2f",
+                                            )
+                                        ),
+                                        time=transaction_time,
+                                        hash=transaction_data["hash"],
+                                    )
+                                    db.session.add(transaction)
+                                    db.session.commit()
+            except Exception as e:
+                logging.error(f"Error processing message from {url}: {e}")
+
+    def on_ping(self, ws, message, url):
+        with self.lock:
+            self.connections[url]["last_ping"] = datetime.now(timezone.utc)
+
+    def on_pong(self, ws, message, url):
+        with self.lock:
+            self.connections[url]["last_ping"] = datetime.now(timezone.utc)
 
     def on_error(self, ws, error, url):
         logging.error(f"WebSocket error for {url}: {error}")
-        self.attempt_reconnect(url)
+        with self.lock:
+            self.connections[url]["connected"] = False
 
     def on_close(self, ws, url, close_status_code, close_msg):
-        logging.info(
-            f"WebSocket closed for {url} with code {close_status_code}: {close_msg}"
-        )
-        self.connections[url]["connected"] = False
-
-        # Update active connections and adjust thread pool if necessary
+        logging.info(f"WebSocket closed for {url} with code {close_status_code}: {close_msg}")
         with self.lock:
-            self.active_connections -= 1
-            self.adjust_thread_pool()
+            self.connections[url]["connected"] = False
+        
+        # Reconnection will be handled by the health check
 
-        # Implementing exponential backoff for reconnection
-        retry_delay = INITIAL_RETRY_DELAY
-        for i in range(MAX_RETRIES):
-            time.sleep(retry_delay)
-            if self.connect(url, self.get_websocket_url(url)):
-                break  # Break if reconnection is successful
-            retry_delay = min(
-                retry_delay * 2, MAX_RETRY_DELAY
-            )  # Ensure delay does not exceed a maximum
-
-        if retry_delay >= MAX_RETRY_DELAY:
-            logging.error(f"Max reconnection attempts reached for {url}.")
-
-    def shutdown_executor(self):
-        self.executor.shutdown(wait=True)
-
-    def attempt_reconnect(self, url):
-        if self.connections[url]["retry_count"] < MAX_RETRIES:
-            logging.info(f"Attempting to reconnect to {url}")
-            time.sleep(
-                INITIAL_RETRY_DELAY
-            )  # Simple delay before retrying, consider exponential backoff
-            self.connect(url, self.get_websocket_url(url))
-        else:
-            logging.error(
-                f"Max retries reached for {url}. Consider rotating to another URL if available."
-            )
+    def health_check(self):
+        """Check connection health and restart dead connections"""
+        while not self.shutdown_flag:
+            try:
+                current_time = datetime.now(timezone.utc)
+                
+                for url, conn in self.connections.items():
+                    with self.lock:
+                        if conn["connected"] and conn["last_message"]:
+                            time_since_message = (current_time - conn["last_message"]).total_seconds()
+                            
+                            # If no message for CONNECTION_TIMEOUT seconds, consider connection dead
+                            if time_since_message > CONNECTION_TIMEOUT:
+                                logging.warning(f"Connection to {url} appears dead (no messages for {time_since_message}s), restarting...")
+                                conn["connected"] = False
+                                if conn["ws"]:
+                                    try:
+                                        conn["ws"].close()
+                                    except:
+                                        pass
+                                
+                                # Restart connection
+                                websocket_url = (
+                                    f"wss://{url}"
+                                    if not url.startswith(("localhost", "[::1]"))
+                                    else f"ws://{url}"
+                                )
+                                self.executor.submit(self.connect_with_retry, url, websocket_url)
+                
+                time.sleep(30)  # Check every 30 seconds
+                
+            except Exception as e:
+                logging.error(f"Error in health check: {e}")
+                time.sleep(30)
 
     def shutdown(self):
+        self.shutdown_flag = True
         with self.lock:
-            self.executor.shutdown(wait=True)  # Gracefully shutdown the executor
+            for url, conn in self.connections.items():
+                if conn["ws"]:
+                    try:
+                        conn["ws"].close()
+                    except:
+                        pass
+        self.executor.shutdown(wait=True)
 
 
 ws_manager = WebSocketManager()
@@ -239,7 +274,7 @@ def websocket_status():
                 "%Y-%m-%d %H:%M:%S UTC"
             )
             last_message_ago = int(
-                (datetime.utcnow() - ws_manager.last_message_time).total_seconds()
+                (datetime.now(timezone.utc) - ws_manager.last_message_time).total_seconds()
             )
             status = {
                 "status": True,
